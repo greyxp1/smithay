@@ -10,118 +10,17 @@ use std::sync::Arc;
 #[derive(Debug, Clone)]
 pub struct GlesTexture(pub(super) Arc<GlesTextureInternal>);
 
-/// A texture object sharing the pixels and synchronization of a [`GlesTexture`].
-///
-/// Sampling parameters belong to this view, independently of its source texture.
-/// The view must be used in the context that created it, or a shared context.
-/// Callers manage bindless residency established in additional or externally managed contexts.
-#[derive(Debug, Clone)]
-pub struct GlesTextureView(pub(super) Arc<GlesTextureViewInner>);
-
-#[derive(Debug)]
-pub(super) struct GlesTextureViewInner {
-    pub source: GlesTexture,
-    pub texture: ffi::types::GLuint,
-    pub cleanup: Arc<ViewCleanupOwner>,
-}
-
-#[derive(Debug)]
-pub(super) struct ViewCleanupOwner {
-    pub id: ContextId<GlesTexture>,
-    pending: Mutex<Option<Vec<ffi::types::GLuint>>>,
-    shared: Sender<CleanupResource>,
-}
-
-impl ViewCleanupOwner {
-    fn delete(&self, texture: ffi::types::GLuint) {
-        let mut pending = self.pending.lock().unwrap();
-        if let Some(pending) = pending.as_mut() {
-            pending.push(texture);
-        } else {
-            let _ = self.shared.send(CleanupResource::Texture(texture));
-        }
-    }
-}
-
-#[derive(Debug)]
-pub(super) struct ViewCleanup(pub Arc<ViewCleanupOwner>);
-
-impl ViewCleanup {
-    pub fn new(shared: Sender<CleanupResource>) -> Self {
-        Self(Arc::new(ViewCleanupOwner {
-            id: ContextId::new(),
-            pending: Mutex::new(Some(Vec::new())),
-            shared,
-        }))
-    }
-
-    pub fn cleanup(&self, egl: &EGLContext, gl: &Gles2) -> Result<(), MakeCurrentError> {
-        let mut pending = self.0.pending.lock().unwrap();
-        let Some(pending) = pending.as_mut().filter(|pending| !pending.is_empty()) else {
-            return Ok(());
-        };
-        if !egl.is_current() {
-            unsafe {
-                egl.make_current()?;
-            }
-        }
-        unsafe {
-            gl.DeleteTextures(pending.len() as i32, pending.as_ptr());
-        }
-        pending.clear();
-        Ok(())
-    }
-}
-
-impl Drop for ViewCleanup {
-    fn drop(&mut self) {
-        // This field drops after the owned EGL context, whose residencies are now gone.
-        // Close the queue atomically so late view drops use the surviving share group.
-        let pending = self.0.pending.lock().unwrap().take().unwrap_or_default();
-        for texture in pending {
-            let _ = self.0.shared.send(CleanupResource::Texture(texture));
-        }
-    }
-}
-
-impl GlesTextureView {
-    /// Whether this view shares pixels with the given source texture.
-    pub fn is_view_of(&self, source: &GlesTexture) -> bool {
-        Arc::ptr_eq(&self.0.source.0, &source.0)
-    }
-    /// OpenGL texture name. Ownership remains with this view.
-    pub fn tex_id(&self) -> ffi::types::GLuint {
-        self.0.texture
-    }
-
-    /// The texture whose pixels this view shares.
-    pub fn source(&self) -> &GlesTexture {
-        &self.0.source
-    }
-
-    /// Whether sampling requires `samplerExternalOES`.
-    pub fn is_external(&self) -> bool {
-        self.0.source.0.is_external
-    }
-
-    /// Whether the texture contains an alpha channel.
-    pub fn has_alpha(&self) -> bool {
-        self.0.source.0.has_alpha
-    }
-}
-
-impl Drop for GlesTextureViewInner {
-    fn drop(&mut self) {
-        *self.source.0.view_references.lock().unwrap() -= 1;
-        self.cleanup.delete(self.texture);
-    }
-}
-
 impl GlesTexture {
+    /// Whether samples contain alpha rather than an implicit opaque channel.
+    pub fn has_alpha(&self) -> bool {
+        self.0.has_alpha
+    }
+
     /// Whether sampling this texture requires `samplerExternalOES`.
     pub fn is_external(&self) -> bool {
         self.0.is_external
     }
+
     /// Create a GlesTexture from a raw gl texture id.
     ///
     /// It is expected to not be external or y_inverted.
@@ -141,7 +40,6 @@ impl GlesTexture {
         GlesTexture(Arc::new(GlesTextureInternal {
             texture: tex,
             sync: RwLock::default(),
-            view_references: Mutex::new(0),
             format: internal_format,
             has_alpha: !opaque,
             is_external: false,
@@ -164,19 +62,13 @@ impl GlesTexture {
         self.0.y_inverted
     }
 
-    /// Whether this is the only snapshot reference to this texture (strong or weak).
-    ///
-    /// Texture views share live pixels rather than retaining a snapshot, so they
-    /// do not prevent updating the source's contents.
+    /// Whether this is the only reference to this texture (strong or weak)
     ///
     /// Note that this tracks only references to this Smithay object (that you can get by cloning
     /// it). If you make a reference via OpenGL directly somehow, you need to keep track of it on
     /// your own.
     pub fn is_unique_reference(&mut self) -> bool {
-        {
-            let views = self.0.view_references.lock().unwrap();
-            Arc::strong_count(&self.0) == 1 + *views && Arc::weak_count(&self.0) == 0
-        }
+        Arc::get_mut(&mut self.0).is_some()
     }
 }
 
@@ -184,23 +76,22 @@ impl GlesTexture {
 pub(super) struct TextureSync {
     pub read_sync: Mutex<ReadSync>,
     write_sync: Mutex<Option<ffi::types::GLsync>>,
-    pub view_image: Option<EGLImage>,
 }
 
 #[derive(Debug, Default)]
 pub(super) struct ReadSync {
     normal: Option<ffi::types::GLsync>,
-    pub views: Option<Arc<ViewReadFence>>,
+    pub batch: Option<Arc<BatchReadFence>>,
 }
 
 #[derive(Debug)]
-pub(super) struct ViewReadFence {
+pub(super) struct BatchReadFence {
     pub context: ContextId<GlesTexture>,
     pub sync: ffi::types::GLsync,
     pub sender: Sender<CleanupResource>,
 }
 
-impl Drop for ViewReadFence {
+impl Drop for BatchReadFence {
     fn drop(&mut self) {
         let _ = self.sender.send(CleanupResource::Sync(self.sync));
     }
@@ -242,7 +133,7 @@ impl TextureSync {
         unsafe {
             let reads = self.read_sync.get_mut().unwrap();
             wait_for_syncpoint(&mut reads.normal, gl);
-            if let Some(fence) = reads.views.take() {
+            if let Some(fence) = reads.batch.take() {
                 gl.WaitSync(fence.sync, 0, ffi::TIMEOUT_IGNORED);
             }
             wait_for_syncpoint(self.write_sync.get_mut().unwrap(), gl);
@@ -266,7 +157,6 @@ impl TextureSync {
 pub(super) struct GlesTextureInternal {
     pub(super) texture: ffi::types::GLuint,
     pub(super) sync: RwLock<TextureSync>,
-    pub(super) view_references: Mutex<usize>,
     pub(super) format: Option<ffi::types::GLenum>,
     pub(super) has_alpha: bool,
     pub(super) is_external: bool,
@@ -300,11 +190,6 @@ impl Drop for GlesTextureInternal {
                     .destruction_callback_sender
                     .send(CleanupResource::EGLImage(image));
             }
-        }
-        if let Some(image) = sync.view_image.take() {
-            let _ = self
-                .destruction_callback_sender
-                .send(CleanupResource::EGLImage(image));
         }
     }
 }
