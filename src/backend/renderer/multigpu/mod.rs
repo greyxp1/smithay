@@ -1509,6 +1509,34 @@ where
     <<R::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
     <<T::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
 {
+    /// Import and synchronize a texture before custom rendering through the underlying frame.
+    pub fn prepare_texture(
+        &mut self,
+        texture: &MultiTexture,
+    ) -> Result<ContextId<<<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId>, Error<R, T>>
+    where
+        <<R::Device as ApiDevice>::Renderer as RendererSuper>::TextureId: Clone + Send,
+    {
+        let render_id = self.frame.as_mut().unwrap().context_id();
+        let sync = texture.needs_synchronization::<R>(&render_id);
+        if let Some(sync) = sync {
+            if let Err(err) = self.frame.as_mut().unwrap().wait(&sync) {
+                trace!(?err, "Failed to import sync point, blocking");
+                let _ = sync.wait();
+            }
+        }
+        texture
+            .reimport::<R>(unsafe { (*self.render).renderer_mut() })
+            .map_err(Error::Render)?;
+
+        Ok(render_id)
+    }
+
+    /// Report output damage written by custom rendering through the underlying frame.
+    pub fn add_damage(&mut self, damage: impl IntoIterator<Item = Rectangle<i32, Physical>>) {
+        self.damage.extend(damage);
+    }
+
     fn flush_frame(&mut self) -> Result<(), Error<R, T>> {
         if self.target.is_some() {
             let _ = self.finish_internal()?;
@@ -2082,17 +2110,7 @@ where
         src_transform: Transform,
         alpha: f32,
     ) -> Result<(), Error<R, T>> {
-        let render_id = self.frame.as_mut().unwrap().context_id();
-        let sync = texture.needs_synchronization::<R>(&render_id);
-        if let Some(sync) = sync {
-            if let Err(err) = self.frame.as_mut().unwrap().wait(&sync) {
-                trace!(?err, "Failed to import sync point, blocking");
-                let _ = sync.wait();
-            }
-        }
-        texture
-            .reimport::<R>(unsafe { (*self.render).renderer_mut() })
-            .map_err(Error::Render)?;
+        let render_id = self.prepare_texture(texture)?;
 
         if let Some(texture) = texture.get::<R>(&render_id) {
             self.damage.extend(damage.iter().copied().map(|mut rect| {

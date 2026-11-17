@@ -59,7 +59,7 @@ use crate::{
             ffi::egl::{self as ffi_egl, types::EGLImage},
         },
     },
-    utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform},
+    utils::{Buffer as BufferCoord, Physical, Rectangle, Size, Transform, user_data::UserDataMap},
 };
 
 #[cfg(all(feature = "wayland_frontend", feature = "use_system_lib"))]
@@ -79,6 +79,7 @@ pub mod ffi {
 }
 
 enum CleanupResource {
+    Buffer(ffi::types::GLuint),
     Texture(ffi::types::GLuint),
     FramebufferObject(ffi::types::GLuint),
     RenderbufferObject(ffi::types::GLuint),
@@ -301,6 +302,26 @@ pub enum Capability {
     Debug,
 }
 
+/// An owned OpenGL buffer object for custom renderer passes.
+#[derive(Debug)]
+pub struct GlesBufferObject {
+    name: ffi::types::GLuint,
+    cleanup: Sender<CleanupResource>,
+}
+
+impl GlesBufferObject {
+    /// OpenGL buffer name. Ownership remains with this object.
+    pub fn buffer_id(&self) -> ffi::types::GLuint {
+        self.name
+    }
+}
+
+impl Drop for GlesBufferObject {
+    fn drop(&mut self) {
+        let _ = self.cleanup.send(CleanupResource::Buffer(self.name));
+    }
+}
+
 /// GL resources need to be destroyed with a context active on the current thread,
 /// so `Drop` impls don't directly destroy objects, and instead send messages
 /// to free resources on periodic calls to `cleanup`.
@@ -349,6 +370,9 @@ impl GlesCleanup {
         }
         for resource in std::iter::once(first).chain(receiver.try_iter()) {
             match resource {
+                CleanupResource::Buffer(buffer) => unsafe {
+                    gl.DeleteBuffers(1, &buffer);
+                },
                 CleanupResource::Texture(texture) => unsafe {
                     gl.DeleteTextures(1, &texture);
                 },
@@ -421,6 +445,9 @@ pub struct GlesRenderer {
 
     // profiling
     profiler: profiler::GpuProfiler,
+    // Must drop after `egl` so late texture-view deletions can use shared cleanup.
+    view_cleanup: ViewCleanup,
+    local_data: UserDataMap,
 }
 
 /// Handle to the currently rendered frame during [`GlesRenderer::render`](Renderer::render).
@@ -729,6 +756,7 @@ impl GlesRenderer {
 
         let profiler = profiler::GpuProfiler::new(&gl, &exts);
 
+        let view_cleanup = ViewCleanup::new(context.user_data().get::<GlesCleanup>().unwrap().sender.clone());
         let renderer = GlesRenderer {
             gl,
             egl: context,
@@ -758,6 +786,8 @@ impl GlesRenderer {
             gl_debug_span,
 
             profiler,
+            view_cleanup,
+            local_data: UserDataMap::default(),
         };
         renderer.egl.unbind()?;
         Ok(renderer)
@@ -841,6 +871,7 @@ impl GlesRenderer {
     fn cleanup(&mut self) -> Result<(), GlesError> {
         self.dmabuf_cache.retain(|entry, _tex| !entry.is_gone());
         self.buffers.retain(|buffer| !buffer.0.dmabuf.is_gone());
+        self.view_cleanup.cleanup(&self.egl, &self.gl)?;
         self.gles_cleanup().cleanup(&self.egl, &self.gl)?;
         Ok(())
     }
@@ -937,7 +968,11 @@ impl ImportMemWl for GlesRenderer {
                 surface_lock
                     .as_ref()
                     .and_then(|cache| cache.get(&id).cloned())
-                    .filter(|texture| texture.size == (width, height).into())
+                    .filter(|texture| {
+                        texture.size == (width, height).into()
+                            && texture.format == Some(internal_format)
+                            && texture.has_alpha == has_alpha
+                    })
                     .unwrap_or_else(|| {
                         let mut tex = 0;
                         unsafe { self.gl.GenTextures(1, &mut tex) };
@@ -946,6 +981,7 @@ impl ImportMemWl for GlesRenderer {
                         let new = Arc::new(GlesTextureInternal {
                             texture: tex,
                             sync: RwLock::default(),
+                            view_references: Mutex::new(0),
                             format: Some(internal_format),
                             has_alpha,
                             is_external: false,
@@ -972,7 +1008,7 @@ impl ImportMemWl for GlesRenderer {
                 self.gl
                     .PixelStorei(ffi::UNPACK_ROW_LENGTH, stride / pixelsize as i32);
 
-                if upload_full || damage.is_empty() {
+                if upload_full {
                     trace!("Uploading shm texture");
                     self.gl.TexImage2D(
                         ffi::TEXTURE_2D,
@@ -981,6 +1017,18 @@ impl ImportMemWl for GlesRenderer {
                         width,
                         height,
                         0,
+                        read_format,
+                        type_,
+                        ptr.offset(offset as isize) as *const _,
+                    );
+                } else if damage.is_empty() {
+                    self.gl.TexSubImage2D(
+                        ffi::TEXTURE_2D,
+                        0,
+                        0,
+                        0,
+                        width,
+                        height,
                         read_format,
                         type_,
                         ptr.offset(offset as isize) as *const _,
@@ -1116,6 +1164,7 @@ impl ImportMem for GlesRenderer {
             GlesTextureInternal {
                 texture: tex,
                 sync,
+                view_references: Mutex::new(0),
                 format: Some(internal),
                 has_alpha,
                 is_external: false,
@@ -1257,6 +1306,7 @@ impl ImportEgl for GlesRenderer {
         let texture = GlesTexture(Arc::new(GlesTextureInternal {
             texture: tex,
             sync: RwLock::default(),
+            view_references: Mutex::new(0),
             format: match egl.format {
                 EGLFormat::RGB | EGLFormat::RGBA => Some(ffi::RGBA8),
                 EGLFormat::External => None,
@@ -1311,6 +1361,7 @@ impl ImportDma for GlesRenderer {
             let texture = GlesTexture(Arc::new(GlesTextureInternal {
                 texture: tex,
                 sync: RwLock::default(),
+                view_references: Mutex::new(0),
                 format: Some(format),
                 has_alpha,
                 is_external,
@@ -1929,8 +1980,11 @@ impl Blit for GlesRenderer {
 impl Drop for GlesRenderer {
     fn drop(&mut self) {
         let _guard = self.span.enter();
+        drop(std::mem::take(&mut self.local_data));
         unsafe {
             if self.egl.make_current().is_ok() {
+                let _ = self.view_cleanup.cleanup(&self.egl, &self.gl);
+                let _ = self.gles_cleanup().cleanup(&self.egl, &self.gl);
                 self.gl.BindFramebuffer(ffi::FRAMEBUFFER, 0);
                 self.gl.DeleteProgram(self.solid_program.program);
                 self.gl.DeleteBuffers(self.vbos.len() as i32, self.vbos.as_ptr());
@@ -2183,6 +2237,175 @@ impl GlesRenderer {
 }
 
 impl GlesFrame<'_, '_> {
+    /// Data owned by this renderer, rather than its texture-sharing context group.
+    /// Values drop before renderer teardown, so owned GL objects can queue cleanup.
+    pub fn local_user_data(&self) -> &UserDataMap {
+        &self.renderer.local_data
+    }
+
+    /// Create an owned buffer object without allocating its storage.
+    pub fn create_buffer_object(&mut self) -> Result<GlesBufferObject, GlesError> {
+        let mut name = 0;
+        self.with_context(|gl| unsafe {
+            gl.GenBuffers(1, &mut name);
+        })?;
+        Ok(GlesBufferObject {
+            name,
+            cleanup: self.renderer.gles_cleanup().sender.clone(),
+        })
+    }
+
+    /// Identity of this renderer instance, distinct from its texture-sharing context.
+    pub fn instance_id(&self) -> ContextId<GlesTexture> {
+        self.renderer.view_cleanup.0.id.clone()
+    }
+
+    /// Create an independently configurable texture object sharing the source's pixels.
+    ///
+    /// No pixels are copied. Use [`Self::with_texture_views`] when sampling the view
+    /// in custom GL code so shared-context uploads and reads remain synchronized.
+    pub fn create_texture_view(&mut self, source: &GlesTexture) -> Result<GlesTextureView, GlesError> {
+        let gl = &self.renderer.gl;
+        if !gl.EGLImageTargetTexture2DOES.is_loaded() {
+            return Err(GlesError::GLExtensionNotSupported(&["GL_OES_EGL_image"]));
+        }
+
+        let mut sync = source.0.sync.write().unwrap();
+        let image = if let Some(image) = source.0.egl_images.as_ref().and_then(|images| images.first()) {
+            *image
+        } else if let Some(image) = sync.view_image {
+            image
+        } else {
+            if !self
+                .renderer
+                .egl
+                .display()
+                .extensions()
+                .iter()
+                .any(|extension| extension == "EGL_KHR_gl_texture_2D_image")
+            {
+                return Err(GlesError::EGLExtensionNotSupported(&[
+                    "EGL_KHR_gl_texture_2D_image",
+                ]));
+            }
+            let image = unsafe {
+                ffi_egl::CreateImageKHR(
+                    **self.renderer.egl.display().get_display_handle(),
+                    self.renderer.egl.get_context_handle(),
+                    ffi_egl::GL_TEXTURE_2D,
+                    source.0.texture as usize as *const _,
+                    [
+                        ffi_egl::GL_TEXTURE_LEVEL as i32,
+                        0,
+                        ffi_egl::IMAGE_PRESERVED as i32,
+                        ffi_egl::TRUE as i32,
+                        ffi_egl::NONE as i32,
+                    ]
+                    .as_ptr(),
+                )
+            };
+            if image == ffi_egl::NO_IMAGE_KHR {
+                return Err(GlesError::BindBufferEGLError(
+                    crate::backend::egl::Error::EGLImageCreationFailed,
+                ));
+            }
+            sync.view_image = Some(image);
+            image
+        };
+
+        let (target, binding) = if source.0.is_external {
+            (ffi::TEXTURE_EXTERNAL_OES, ffi::TEXTURE_BINDING_EXTERNAL_OES)
+        } else {
+            (ffi::TEXTURE_2D, ffi::TEXTURE_BINDING_2D)
+        };
+        let mut previous = 0;
+        let mut texture = 0;
+        unsafe {
+            gl.GetIntegerv(binding, &mut previous);
+            gl.GenTextures(1, &mut texture);
+            gl.BindTexture(target, texture);
+            gl.EGLImageTargetTexture2DOES(target, image);
+            gl.TexParameteri(target, ffi::TEXTURE_MIN_FILTER, ffi::LINEAR as i32);
+            gl.TexParameteri(target, ffi::TEXTURE_MAG_FILTER, ffi::LINEAR as i32);
+            gl.TexParameteri(target, ffi::TEXTURE_WRAP_S, ffi::CLAMP_TO_EDGE as i32);
+            gl.TexParameteri(target, ffi::TEXTURE_WRAP_T, ffi::CLAMP_TO_EDGE as i32);
+            gl.BindTexture(target, previous as u32);
+            if gl.GetError() != ffi::NO_ERROR {
+                gl.DeleteTextures(1, &texture);
+                return Err(GlesError::UnsupportedPixelLayout);
+            }
+        }
+        let mut references = source.0.view_references.lock().unwrap();
+        let view_source = source.clone();
+        *references += 1;
+        Ok(GlesTextureView(Arc::new(GlesTextureViewInner {
+            source: view_source,
+            texture,
+            cleanup: self.renderer.view_cleanup.0.clone(),
+        })))
+    }
+
+    /// Sample texture views in custom GL code with the source textures' synchronization.
+    ///
+    /// The callback must not import or update these source textures while their
+    /// sampling guards are held.
+    pub fn with_texture_views<T>(
+        &mut self,
+        views: &[GlesTextureView],
+        draw: impl FnOnce(&mut Self) -> Result<T, GlesError>,
+    ) -> Result<T, GlesError> {
+        if views.is_empty() {
+            return draw(self);
+        }
+        let mut sources = views
+            .iter()
+            .map(|view| &view.0.source.0)
+            .collect::<smallvec::SmallVec<[_; 4]>>();
+        sources.sort_unstable_by_key(|source| Arc::as_ptr(source));
+        sources.dedup_by_key(|source| Arc::as_ptr(source));
+        // All shared renderers take per-source locks in the same order.
+        let locks = sources
+            .iter()
+            .map(|source| source.sync.read().unwrap())
+            .collect::<smallvec::SmallVec<[_; 4]>>();
+        for lock in &locks {
+            lock.wait_for_upload(&self.renderer.gl);
+        }
+        let result = draw(self);
+        if self.renderer.capabilities.contains(&Capability::Fencing) {
+            let mut reads = locks
+                .iter()
+                .map(|lock| lock.read_sync.lock().unwrap())
+                .collect::<smallvec::SmallVec<[_; 4]>>();
+            let mut waited = smallvec::SmallVec::<[_; 4]>::new();
+            for read in &reads {
+                if let Some(fence) = &read.views {
+                    if fence.context == self.renderer.view_cleanup.0.id {
+                        continue;
+                    }
+                    let pointer = Arc::as_ptr(fence);
+                    if !waited.contains(&pointer) {
+                        unsafe {
+                            self.renderer.gl.WaitSync(fence.sync, 0, ffi::TIMEOUT_IGNORED);
+                        }
+                        waited.push(pointer);
+                    }
+                }
+            }
+            let fence = Arc::new(ViewReadFence {
+                context: self.renderer.view_cleanup.0.id.clone(),
+                sync: unsafe { self.renderer.gl.FenceSync(ffi::SYNC_GPU_COMMANDS_COMPLETE, 0) },
+                sender: self.renderer.gles_cleanup().sender.clone(),
+            });
+            for read in &mut reads {
+                read.views = Some(fence.clone());
+            }
+        } else if self.renderer.egl.is_shared() {
+            unsafe { self.renderer.gl.Finish() };
+        }
+        result
+    }
+
     /// Run custom code in the GL context owned by this renderer.
     ///
     /// The OpenGL state of the renderer is considered an implementation detail
@@ -3298,7 +3521,8 @@ impl Drop for GlesFrame<'_, '_> {
     }
 }
 
-fn build_texture_mat(
+/// Map destination-relative physical pixels to normalized source texture coordinates.
+pub fn build_texture_mat(
     src: Rectangle<f64, BufferCoord>,
     dest: Rectangle<i32, Physical>,
     texture: Size<i32, BufferCoord>,
